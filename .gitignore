@@ -22,3 +22,6 @@ Thumbs.db
 
 # Saídas (se não quiser versionar CSVs gerados)
 *.csv
+
+#CREDENCIAIS BASE
+.base
