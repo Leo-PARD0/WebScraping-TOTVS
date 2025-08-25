@@ -1,0 +1,12 @@
+login:
+  user: "#UserName"          # campo usuário (input)
+  password: "#Senha"         # campo senha (input)
+  submit: "#btnLogin"        # botão entrar
+  after_login: "#navbar .current-domain"  # aparece após login
+
+dominio:
+  container: "#divDomain"    # container da tela de domínio
+  combo: "#comboBoxDomain_chosen"  # dropdown
+  opcao: "#comboBoxDomain_chosen .chosen-results li.active-result"
+  entrar: "#btnEntrar"
+  confirmado: "ul#novoMenu"  # elemento que confirma entrada no sistema
