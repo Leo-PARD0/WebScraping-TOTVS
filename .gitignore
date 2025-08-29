@@ -23,5 +23,11 @@ Thumbs.db
 # Saídas (se não quiser versionar CSVs gerados)
 *.csv
 
-#CREDENCIAIS BASE
+# Visualização de erro
+artifacts
+
+# CREDENCIAIS BASE
 .base
+
+# html da página
+.ref

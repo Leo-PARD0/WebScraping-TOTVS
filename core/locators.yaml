@@ -10,3 +10,55 @@ dominio:
   opcao: "#comboBoxDomain_chosen .chosen-results li.active-result"
   entrar: "#btnEntrar"
   confirmado: "ul#novoMenu"  # elemento que confirma entrada no sistema
+
+cadastro_produtos:
+  
+  menu:
+    container_ids:
+      - "menus"       # container do menu aberto (legado)
+      - "novoMenu"    # fallback, caso exista no teu ambiente
+    toggle_ids:
+      - "newMenu"     # botão/hambúrguer que abre o menu (legado)
+    overlay_ids:
+      - "divLoading"  # overlay de carregamento que bloqueia clique
+
+  produto_servico:
+    hrefs:
+      - "/Cadastros/ProdutoServico"  # item de menu (legado)
+    checks:
+      - by: css
+        value: "form#formProduto, #formProduto"
+      - by: xpath
+        value: "//h1[contains(.,'Produto')]"
+      - by: css
+        value: "#tabPanelResultContainer .dxgvTable, #tabPanelResultContainer [id^='dataGrid_DXMainTable']"
+
+  # Se a tela abrir dentro de iframe, descomente e preencha:
+  # tela_iframe:
+  #   css:
+  #     - "iframe#conteudo"
+
+  # (Opcional) aba de resultados — teu submódulo ativa se existir
+  # tabs:
+  #   result_tab:
+  #     - "a[href='#resultado']"
+  #     - "[data-testid='tab-resultados']"
+
+  grid:
+    container_css:
+      - "#tabPanelResultContainer .dxgvTable"
+      - "#tabPanelResultContainer [id^='dataGrid_DXMainTable']"
+    header_css:
+      - "thead th"
+    row_css:
+      - "tr[id^='dataGrid_DXDataRow']"
+      - "tr.dxgvDataRow"
+
+
+  pagination:
+    next:
+      by: xpath
+      value: "//a[contains(@onclick, 'PBN') and .//img[@alt='Next']]"
+    anchor:
+      by: css
+      value: ".dxp-current"

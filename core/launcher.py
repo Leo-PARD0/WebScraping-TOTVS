@@ -3,47 +3,43 @@
 - Lê configurações de .env ou ENV.
 - Cria o driver configurado.
 - Faz login e seleção de domínio.
-- Lista e executa módulos disponíveis em `modulos/`.
+- Lista e executa módulos disponíveis em `modulos/` (inclui pacotes).
+- Permite escolher o módulo por CLI (--mod) ou ENV (APP_MODULE).
 """
 
-import importlib
+from __future__ import annotations
+
+import argparse
 import logging
+import os
 import sys
 import traceback
-from pathlib import Path
 from dataclasses import dataclass
 from getpass import getpass
+from pathlib import Path
+from typing import Optional, Tuple
+import importlib
+
 
 from dotenv import load_dotenv
 
-# --- imports do stdlib aqui em cima ---
-import importlib
-import logging
-import sys
-import traceback
-from pathlib import Path
-from dataclasses import dataclass
-from getpass import getpass
 
-# Tente importar como pacote (execução via: python -m core.launcher)
+
+# Import preferindo modo pacote: `python -m core.launcher`
 try:
     from .browser import build_driver
     from .auth import login, selecionar_dominio
     from .utils import listar_modulos, escolher_modulo, screenshot
-# Se falhar, ajuste o sys.path e importe absoluto (execução via: python core/launcher.py)
+    from core._ui import escolher_modulo_no_navegador, toast 
 except ImportError:
+    # Fallback para execução direta: `python core/launcher.py`
     BASE_DIR = Path(__file__).resolve().parents[1]
     if str(BASE_DIR) not in sys.path:
         sys.path.append(str(BASE_DIR))
     from core.browser import build_driver
     from core.auth import login, selecionar_dominio
     from core.utils import listar_modulos, escolher_modulo, screenshot
-
-from .browser import build_driver
-from .auth import login, selecionar_dominio
-from .utils import listar_modulos, escolher_modulo, screenshot
-
-
+    from core._ui import escolher_modulo_no_navegador 
 
 log = logging.getLogger("launcher")
 
@@ -51,6 +47,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 ARTIFACTS = BASE_DIR / "artifacts"
 ARTIFACTS.mkdir(exist_ok=True, parents=True)
 
+# Carrega .env da raiz (se existir)
 load_dotenv(BASE_DIR / ".env")
 
 
@@ -67,19 +64,39 @@ class Config:
     user_data_dir: str | None = None
 
 
-def get_config() -> Config:
+def _parse_cli() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Launcher WebScraping-TOTVS")
+    p.add_argument("--mod", help="Nome do módulo em modulos/ (ex.: cadastro_produtos)")
+    p.add_argument("--sub", help="Nome do submódulo em modulos/<mod>/submods/ (ex.: extrair_aliquota)")  # <-- NOVO
+    p.add_argument("--headless", action="store_true", help="Força navegador headless")
+    p.add_argument("--log", default=os.getenv("APP_LOG_LEVEL", "INFO"), help="Nivel de log (DEBUG, INFO, WARNING)")
+    return p.parse_args()
+
+
+def _setup_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
+    )
+    # Reduz verbosidade de libs ruidosas
+    logging.getLogger("selenium").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def get_config(args: argparse.Namespace) -> Config:
     """
     Lê credenciais de variáveis de ambiente/.env.
-    Se qualquer uma (URL/USER/PASS) não existir, pergunta interativamente
-    e oferece salvar em um arquivo `.env` na raiz do projeto.
+    Pergunta interativamente o que faltar e oferece salvar em `.env`.
+    `--headless` (CLI) sobrescreve HEADLESS do .env/ENV.
     """
-    import os
-
     env_url = os.getenv("TOTVS_URL")
     env_user = os.getenv("TOTVS_USER")
     env_pass = os.getenv("TOTVS_PASS")
-    headless = (os.getenv("HEADLESS", "false").lower() == "true")
+    env_headless = (os.getenv("HEADLESS", "false").lower() == "true")
     user_data_dir = os.getenv("CHROME_USER_DATA_DIR") or None
+
+    headless = args.headless or env_headless
 
     # Se todas as variáveis existem, usa direto
     if env_url and env_user and env_pass:
@@ -110,8 +127,7 @@ def get_config() -> Config:
                 f.write(f"TOTVS_URL={url}\n")
                 f.write(f"TOTVS_USER={user}\n")
                 f.write(f"TOTVS_PASS={password}\n")
-                # Valores opcionais padrão — ajuste depois conforme preferir
-                f.write("HEADLESS=false\n")
+                f.write(f"HEADLESS={'true' if headless else 'false'}\n")
                 f.write("CHROME_USER_DATA_DIR=\n")
             print(f"Credenciais salvas em {env_path}")
         except Exception as e:
@@ -126,34 +142,141 @@ def get_config() -> Config:
     )
 
 
-# ---------- Main ----------
+# ---------- Execução ----------
+
+def _listar_submods(mod_name: str) -> list[str]:
+    subdir = BASE_DIR / "modulos" / mod_name / "submods"
+    if not subdir.exists():
+        return []
+    return [
+        p.stem
+        for p in subdir.glob("*.py")
+        if p.is_file() and p.stem != "__init__"
+    ]
+
+
+def _resolver_modulo(driver, preferido: Optional[str]) -> Tuple[str, callable]:
+    """
+    Escolhe o módulo a executar (aceita arquivos .py e pacotes com __init__.py).
+    Se `preferido` (CLI/ENV) vier, usa direto; senão tenta escolher via UI no navegador.
+    Cai para o menu do console se estiver em headless ou se a UI falhar.
+    """
+    mods = listar_modulos()
+    if not mods:
+        raise SystemExit("[ERRO] Nenhum módulo válido encontrado em modulos/.")
+
+    if preferido:
+        candidatos = [(n, f) for (n, f) in mods if n == preferido]
+        if not candidatos:
+            nomes = ", ".join(n for n, _ in mods) or "<nenhum>"
+            raise SystemExit(f"[ERRO] Módulo '{preferido}' não encontrado. Disponíveis: {nomes}")
+        return candidatos[0]
+
+    if len(mods) == 1:
+        n, f = mods[0]
+        log.info("Selecionando módulo único automaticamente: %s", n)
+        return mods[0]
+    
+    def _listar_submods(mod_name: str) -> list[str]:
+        subdir = BASE_DIR / "modulos" / mod_name / "submods"
+        if not subdir.exists():
+            return []
+        return [p.stem for p in subdir.glob("*.py") if p.is_file() and p.stem != "__init__"]
+
+
+    nomes = [n for (n, _) in mods]
+
+    # Heurística simples para headless
+    is_headless = os.getenv("HEADLESS", "false").lower() == "true"
+
+    if not is_headless:
+        try:
+            default_value = "cadastro_produtos" if "cadastro_produtos" in nomes else (nomes[0] if nomes else None)
+            escolha_nome = escolher_modulo_no_navegador(driver, nomes, default_value=default_value)
+            if escolha_nome:
+                for (n, f) in mods:
+                    if n == escolha_nome:
+                        return (n, f)
+            raise SystemExit("[ERRO] Nenhum módulo selecionado (cancelado na UI).")
+        except Exception as e:
+            log.warning("Falha ao selecionar via UI no navegador (%s). Caindo para menu no console.", e)
+
+    escolha = escolher_modulo(mods)
+    if not escolha:
+        raise SystemExit("[ERRO] Nenhum módulo selecionado.")
+    return escolha
+
 
 def main():
-    cfg = get_config()
+    args = _parse_cli()
+    _setup_logging(args.log)
+
+    preferido = args.mod or os.getenv("APP_MODULE")
+    cfg = get_config(args)
+
     driver = None
     try:
         driver = build_driver(cfg)
+
+        # Login e seleção de domínio deixam a página pronta para injetar a UI
         login(driver, cfg)
         selecionar_dominio(driver)
 
-        mods = listar_modulos()
-        escolhido = escolher_modulo(mods)
-        if not escolhido:
-            return
-        nome, func = escolhido
-        log.info("Executando módulo: %s", nome)
-        func(driver)
-        log.info("Módulo %s concluído.", nome)
+        # Escolha do módulo via UI (ou fallback)
 
+       # ===== Execução direta via CLI: --mod + --sub =====
+        if args.mod and args.sub:
+            # validações (como você já faz) ...
+            mods = listar_modulos()
+            nomes_mod = {n for (n, _) in mods}
+            if args.mod not in nomes_mod:
+                opcoes = ", ".join(sorted(nomes_mod)) or "<nenhum>"
+                raise SystemExit(f"[ERRO] Módulo '{args.mod}' não encontrado. Disponíveis: {opcoes}")
+
+            subs = _listar_submods(args.mod)
+            if args.sub not in subs:
+                opcoes = ", ".join(sorted(subs)) or "<nenhum>"
+                raise SystemExit(f"[ERRO] Submódulo '{args.sub}' não encontrado em '{args.mod}'. Submódulos: {opcoes}")
+
+            # 👉 chama o MAIN do módulo, passando o sub_name
+            pkg_main = importlib.import_module(f"modulos.{args.mod}.main")
+            if not hasattr(pkg_main, "executar"):
+                raise SystemExit(f"[ERRO] Módulo '{args.mod}' não possui função main.executar(driver, sub_name=None).")
+
+            log.info("Executando módulo: %s (sub=%s)", args.mod, args.sub)
+            pkg_main.executar(driver, sub_name=args.sub)
+            return
+        
+        # ===== Execução normal (sem --sub) =====
+        mod_name, _ = _resolver_modulo(driver, preferido)
+        pkg_main = importlib.import_module(f"modulos.{mod_name}.main")
+        if not hasattr(pkg_main, "executar"):
+            raise SystemExit(f"[ERRO] Módulo '{mod_name}' não possui função main.executar(driver, sub_name=None).")
+        log.info("Executando módulo: %s", mod_name)
+        pkg_main.executar(driver, sub_name=None)
+        return
+
+
+    except SystemExit as e:
+        log.error(str(e))
+        raise
     except Exception as e:
         log.error("Erro: %s", e)
         traceback.print_exc()
         if driver:
-            screenshot(driver, "erro_launcher")
+            try:
+                screenshot(driver, "erro_launcher")
+            except Exception:
+                pass
+        raise
     finally:
         if driver:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
     main()
+
