@@ -74,12 +74,15 @@ def next_page_once(
 
     # Captura o número da página antes do clique
     old_page_num = None
+    old_anchor = None
     if wait_anchor_by and wait_anchor_selector:
         try:
             old_page_elem = driver.find_element(wait_anchor_by, wait_anchor_selector)
             old_page_num = old_page_elem.text.strip()
+            old_anchor = old_page_elem
         except Exception:
             old_page_num = None
+            old_anchor = None
 
     if scroll_into_view:
         try:
@@ -95,12 +98,24 @@ def next_page_once(
 
     # Espera o número da página mudar
     if wait_anchor_by and wait_anchor_selector and old_page_num is not None:
+        def _safe_anchor_check(d):
+            try:
+                elem = d.find_element(wait_anchor_by, wait_anchor_selector)
+                return elem.text.strip() != old_page_num
+            except StaleElementReferenceException:
+                return False  # Tenta de novo até timeout
+
         try:
-            WebDriverWait(driver, wait_timeout).until(
-                lambda d: d.find_element(wait_anchor_by, wait_anchor_selector).text.strip() != old_page_num
-            )
+            WebDriverWait(driver, wait_timeout).until(_safe_anchor_check)
         except TimeoutException:
-            log.warning("pagination | Timeout esperando o número da página mudar.")
+            # pode ter avançado mesmo assim; checa heurística
+            try:
+                if wait_anchor_by and wait_anchor_selector:
+                    new_anchor = driver.find_element(wait_anchor_by, wait_anchor_selector)
+                    if old_anchor and new_anchor and new_anchor.id != old_anchor.id:
+                        return True
+            except Exception:
+                pass
             return False
 
     return True

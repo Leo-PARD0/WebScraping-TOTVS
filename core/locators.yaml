@@ -62,3 +62,11 @@ cadastro_produtos:
     anchor:
       by: css
       value: ".dxp-current"
+
+inventario:
+  menu:
+    # Adicione seletores conforme necessário
+
+sample:
+  menu:
+    # Adicione seletores conforme necessário
