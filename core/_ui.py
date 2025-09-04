@@ -17,11 +17,13 @@ def escolher_modulo_no_navegador(
     driver: WebDriver,
     mods: List[str],
     default_value: Optional[str] = None,
+    mensagem: str = "Escolha um submódulo:"
 ) -> Optional[str]:
     """
     Abre um modal simples no navegador para escolher um submódulo.
     - mods: lista de nomes de módulos (p.ex.: ["extrair_aliquota"])
     - default_value: valor sugerido no input
+    - mensagem: texto exibido no topo do popup
     Retorna o nome escolhido (str) ou None se o usuário cancelar.
     """
     return driver.execute_async_script(
@@ -29,6 +31,7 @@ def escolher_modulo_no_navegador(
         const cb = arguments[arguments.length - 1];
         const mods = arguments[0] || [];
         const defV = arguments[1] || '';
+        const msg = arguments[2] || 'Escolha um submódulo:';
 
         // Remove modal anterior, se existir
         const old = document.getElementById('gpt-modal-wrap');
@@ -54,7 +57,7 @@ def escolher_modulo_no_navegador(
 
         box.innerHTML = `
           <div style="margin-bottom:8px;font-size:16px;font-weight:600">
-            Escolha um submódulo (cadastro_produtos/submods/)
+            ${msg.replace(/</g,'&lt;').replace(/>/g,'&gt;')}
           </div>
           <div id="gpt-list" style="display:flex;flex-wrap:wrap;gap:8px;max-height:260px;overflow:auto;margin-bottom:10px"></div>
           <div style="display:flex;gap:8px;align-items:center">
@@ -96,6 +99,7 @@ def escolher_modulo_no_navegador(
         """,
         mods,
         default_value,
+        mensagem,
     )
 
 
@@ -275,4 +279,72 @@ def prompt_paginas_extracao(driver, mensagem="Quantas páginas deseja extrair?",
         ok_text,
         all_text,
         cancel_text,
+    )
+
+
+def dialog_input(driver, mensagem="Digite um valor:", default_value=""):
+    """
+    Mostra um input de texto no navegador e retorna o valor digitado (ou None se cancelar).
+    """
+    return driver.execute_async_script(
+        """
+        const cb = arguments[arguments.length - 1];
+        const msg = arguments[0] || '';
+        const defV = arguments[1] || '';
+
+        // Remove modal anterior, se existir
+        const old = document.getElementById('gpt-dialoginput-wrap');
+        if (old) old.remove();
+
+        // Wrapper
+        const wrap = document.createElement('div');
+        wrap.id = 'gpt-dialoginput-wrap';
+        wrap.style.cssText = [
+          'position:fixed','inset:0','background:rgba(0,0,0,.45)',
+          'display:flex','align-items:center','justify-content:center',
+          'z-index:2147483647'
+        ].join(';');
+
+        // Caixa
+        const box = document.createElement('div');
+        box.style.cssText = [
+          'background:#fff','padding:16px','border-radius:12px',
+          'min-width:320px','max-width:480px',
+          'box-shadow:0 10px 30px rgba(0,0,0,.3)',
+          'font:14px system-ui,Segoe UI,Arial,sans-serif'
+        ].join(';');
+
+        box.innerHTML = `
+          <div style="margin-bottom:10px;font-size:15px">${msg.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+          <input id="gpt-dialoginput-input" style="width:100%;padding:8px;border:1px solid #ccc;border-radius:8px;margin-bottom:12px" placeholder="" value="${defV}">
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button id="gpt-dialoginput-ok" style="padding:8px 12px;border:1px solid #0a84ff;border-radius:8px;background:#0a84ff;color:#fff">OK</button>
+            <button id="gpt-dialoginput-cancel" style="padding:8px 12px;border:1px solid #bbb;border-radius:8px;background:#f5f5f5">Cancelar</button>
+          </div>
+        `;
+
+        wrap.appendChild(box);
+        document.body.appendChild(wrap);
+
+        const input = box.querySelector('#gpt-dialoginput-input');
+        input.focus();
+
+        box.querySelector('#gpt-dialoginput-ok').onclick = () => finish(input.value.trim());
+        box.querySelector('#gpt-dialoginput-cancel').onclick = () => finish(null);
+
+        input.onkeydown = (e) => {
+          if (e.key === 'Enter') box.querySelector('#gpt-dialoginput-ok').click();
+          if (e.key === 'Escape') box.querySelector('#gpt-dialoginput-cancel').click();
+        };
+
+        let done = false;
+        function finish(val){
+          if (done) return;
+          done = true;
+          try { wrap.remove(); } catch(e) {}
+          cb(val);
+        }
+        """,
+        mensagem,
+        default_value,
     )

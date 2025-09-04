@@ -1,200 +1,379 @@
-# extrair_aliquota.py
-"""
-Submódulo: extrair_aliquota
-Coleta dados da grid de produtos (aba de resultados) e exporta CSV/JSON.
-
-Lê seletores de core/locators.yaml (cadastro_produtos.tabs / cadastro_produtos.grid / cadastro_produtos.pagination).
-"""
-
-from __future__ import annotations
-from typing import Iterable, Optional
-from datetime import datetime
-
+# CadastroProdutos/ExtrairAliquota.py
+# importar dependencias
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.common.exceptions import TimeoutException
-
-from core.pagination import next_page_once
-from core import utils
+from pathlib import Path
+import csv
+import time
+import json
 from core._ui import prompt_paginas_extracao
+from core import utils
+from datetime import datetime
 
-from .._navigate import abrir_menu_principal, ir_para_produto_servico
+MAX_PAGES = 140  # limite de páginas a varrer
 
-# ---------------------------
-# Helpers para YAML selectors
-# ---------------------------
-BY_MAP = {
-    "css": By.CSS_SELECTOR,
-    "xpath": By.XPATH,
-    "id": By.ID,
-    "name": By.NAME,
-    "link": By.LINK_TEXT,
-    "partial_link": By.PARTIAL_LINK_TEXT,
-    "tag": By.TAG_NAME,
-    "class": By.CLASS_NAME,
-}
-
-def _as_tuple(selector_info):
-    """
-    Aceita:
-      - {"by": "css", "value": ".seletor"}
-      - {"by": "css", "value": [".a", ".b"]} -> pega o primeiro
-    Retorna: (By.*, "selector") ou (None, None) se vier vazio.
-    """
-    if not selector_info:
-        return None, None
-    by_str = (selector_info.get("by") or "css").lower()
-    by = BY_MAP.get(by_str, By.CSS_SELECTOR)
-    value = selector_info.get("value")
-    if isinstance(value, list):
-        value = value[0] if value else None
-    return by, value
-
-# ---------------------------
-# UI helpers
-# ---------------------------
-def _first_clickable(wait: WebDriverWait, by: str, selectors: Iterable[str]):
-    last_err = None
-    for sel in selectors:
-        try:
-            return wait.until(EC.element_to_be_clickable((by, sel)))
-        except Exception as e:
-            last_err = e
-            continue
-    if last_err:
-        raise last_err
-    return None
-
-def _ativar_aba_resultados(driver: WebDriver, loc: dict, timeout: int = 20) -> None:
-    tabs_cfg = (loc or {}).get("tabs", {}) or {}
-    candidates = tabs_cfg.get("result_tab", []) or []
-    if not candidates:
-        return
-    wait = WebDriverWait(driver, timeout)
+# ==============================
+# helpers de overlay / waitpanel
+# ==============================
+def _overlay_visivel(driver):
+    """True se o underlay/overlay do Dojo (WaitPanel) estiver ativo bloqueando cliques."""
     try:
-        btn = _first_clickable(wait, By.CSS_SELECTOR, candidates)
-        try:
-            btn.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", btn)
-        WebDriverWait(driver, 3).until(lambda d: True)  # pequeno settle
+        return driver.execute_script("""
+            function vis(el){
+              if(!el) return false;
+              var s = getComputedStyle(el);
+              if (s.display === 'none' || s.visibility === 'hidden') return false;
+              return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+            }
+            // wrapper do underlay
+            var wrap = document.querySelector('[id^="dijit_DialogUnderlay_"]') ||
+                       document.getElementById('dijit_DialogUnderlay_0');
+            // underlay interno
+            var ul = document.getElementById('WaitPanelDialog_underlay') ||
+                     (wrap ? wrap.querySelector('.dijitDialogUnderlay, ._underlay') : null);
+            // diálogo (redundância)
+            var dlg = document.getElementById('WaitPanelDialog');
+
+            // estado dojo, se exposto
+            var dojoOpen = false;
+            try {
+              if (window.dijit && dijit.byId) {
+                var w = dijit.byId('WaitPanelDialog');
+                if (w && typeof w.get === 'function') dojoOpen = !!w.get('open');
+              }
+            } catch(e){}
+
+            return dojoOpen || vis(wrap) || vis(ul) || vis(dlg);
+        """)
     except Exception:
-        pass  # se não achou/ativou, segue assim mesmo
+        return False
 
-# ---------------------------
-# Coleta da grid
-# ---------------------------
-def _coletar_dados_tabela(driver: WebDriver, loc: dict, timeout: int = 25) -> list[dict]:
-    wait = WebDriverWait(driver, timeout)
-    grid_cfg = (loc or {}).get("grid", {}) or {}
+def waitingpanel(driver, timeout=250, tag=""):
+    """Espera até timeout o underlay desaparecer. Continua mesmo que estoure."""
+    print(f"DEBUG: aguardando WAITPANEL {tag} sumir (até {timeout}s)…")
+    fim = time.time() + timeout
+    ultimo = None
+    while time.time() < fim:
+        ativo = _overlay_visivel(driver)
+        if ativo != ultimo:
+            print(f"DEBUG: WAITPANEL {tag} -> {'ATIVO' if ativo else 'OCULTO'}")
+            ultimo = ativo
+        if not ativo:
+            return True
+        time.sleep(0.10)
+    print(f"DEBUG: WAITPANEL {tag} ainda ativo ao fim; seguindo assim mesmo…")
+    return False
 
-    container_css = grid_cfg.get("container_css", []) or ["#gridProdutos", "table#gridProdutos"]
-    header_css    = grid_cfg.get("header_css", [])    or ["thead th"]
-    row_css       = grid_cfg.get("row_css", [])       or ["tbody tr"]
+# ======================
+# resultado / edição UI
+# ======================
+def esperar_resultado_visivel(driver, timeout=20):
+    """Garante que a aba de RESULTADO está visível (edição fechada)."""
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script(
+            "var e=document.getElementById('tabPanelEdition'), r=document.getElementById('tabPanelResult');"
+            "return e && getComputedStyle(e).display=='none' && r && getComputedStyle(r).display!='none';"
+        )
+    )
 
-    # 1) Melhor chance de estar na aba certa
-    _ativar_aba_resultados(driver, loc, timeout=max(10, timeout // 2))
+def esperar_edicao_visivel(driver, timeout=20):
+    """Garante que a aba de EDIÇÃO está visível (edit form aberto)."""
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script(
+            "var e=document.getElementById('tabPanelEdition');"
+            "return e && getComputedStyle(e).display!='none';"
+        )
+    )
+    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.ID, "tabPanelEditionContainer")))
 
-    # 2) Container da grid
-    grid = None
-    last_err = None
-    for sel in container_css:
-        try:
-            grid = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, sel)))
-            break
-        except Exception as e:
-            last_err = e
-            continue
-    if not grid:
-        raise TimeoutException("Grid não localizada. Ajuste 'cadastro_produtos.grid.container_css' no YAML.") from last_err
+# ===================================
+# continuar driver / garantir a tela
+# ===================================
+def continua_drive(driver, timeout=20):
+    """continua com o navegador já logado/aberto, garantindo a aba de resultados."""
+    WebDriverWait(driver, timeout).until(
+        EC.visibility_of_element_located((By.ID, "tabPanelResultContainer"))
+    )
+    # pelo menos 1 linha carregada
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("""
+            var rc = document.getElementById('tabPanelResultContainer');
+            if (!rc) return false;
+            var tbl = rc.querySelector('.dxgvTable,[id^="dataGrid_DXMainTable"]');
+            if (!tbl) return false;
+            var rows = tbl.querySelectorAll('tr[id^="dataGrid_DXDataRow"], tr.dxgvDataRow');
+            return rows.length >= 1;
+        """)
+    )
 
-    # 3) Cabeçalhos
-    headers: list[str] = []
-    for hsel in header_css:
-        try:
-            headers = [th.text.strip() for th in grid.find_elements(By.CSS_SELECTOR, hsel)]
-            headers = [h for h in headers if h]
-            if headers:
-                break
-        except Exception:
-            continue
+# ============================
+# modal (Sim/Não) robusto
+# ============================
+def clicar_botao_modal(driver, *rotulos):
+    """
+    Clica em um botão/ancora com texto entre 'rotulos' dentro da ÚLTIMA modal visível.
+    Ex.: clicar_botao_modal(driver, 'Sim', 'Yes', 'OK', 'Confirmar')
+    """
+    roots = [
+        "//div[contains(@class,'bootbox') and contains(@class,'modal') and (contains(@class,'in') or contains(@style,'display: block'))][last()]",
+        "//div[contains(@class,'modal') and (contains(@class,'in') or contains(@style,'display: block'))][last()]",
+        "//body"
+    ]
+    for root in roots:
+        for rot in rotulos:
+            xp = (
+                f"{root}//*[self::button or self::a]"
+                f"[normalize-space()='{rot}' or "
+                f" contains(translate(.,"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÀÂÃÉÊÍÓÔÕÚÇ',"
+                f"'abcdefghijklmnopqrstuvwxyzáàâãéêíóôõúç'),"
+                f" '{rot.lower()}')]"
+            )
+            try:
+                WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.XPATH, xp))).click()
+                return True
+            except Exception:
+                pass
+    return False
 
-    # 4) Linhas
-    rows = []
-    for rsel in row_css:
-        try:
-            rows = grid.find_elements(By.CSS_SELECTOR, rsel)
-            if rows:
-                break
-        except Exception:
-            continue
-
-    # 5) Montagem dos registros
-    registros: list[dict] = []
-    for row in rows:
-        cols = [td.text.strip() for td in row.find_elements(By.CSS_SELECTOR, "td")]
-        if not any(cols):
-            continue
-
-        if headers and len(headers) == len(cols):
-            d = dict(zip([h.lower() for h in headers], cols))
-        else:
-            d = {f"col_{i+1}": v for i, v in enumerate(cols)}
-        registros.append(d)
-
-    return registros
-
-# ---------------------------
-# Orquestração
-# ---------------------------
-def _na_tela_produto(driver) -> bool:
+# ============================
+# resolutores / click helpers
+# ============================
+def nisclickable(driver, n, g=None, timeout=12):
+    """verifica se 'n' está clicável (True/False)."""
     try:
-        WebDriverWait(driver, 5).until(EC.any_of(
-            EC.visibility_of_element_located((By.CSS_SELECTOR, "form#formProduto, #formProduto")),
-            EC.visibility_of_element_located((By.CSS_SELECTOR, "#tabPanelResultContainer .dxgvTable, #tabPanelResultContainer [id^='dataGrid_DXMainTable']")),
-            EC.visibility_of_element_located((By.XPATH, "//h1[contains(.,'Produto')]")),
-        ))
+        if n.lower() in ("linha", "linha da grid"):
+            driver.execute_script(
+                "try{ if(window.dataGrid){ dataGrid.SetFocusedRowIndex(arguments[0]); } }catch(e){}",
+                int(g)
+            )
+            return True
+        if n.lower() in ("editar", "btn editar"):
+            return True
+        by, sel = _resolver_locator(n)
+        WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, sel)))
         return True
     except Exception:
         return False
-    
-# --- PAGER NUMÉRICO (DevExpress): vai para a próxima página clicando no número (cur+1)
-def _pager_click_next_by_number(
-    driver,
-    *,
-    wait_anchor_by=None,
-    wait_anchor_selector=None,
-    wait_timeout: float = 15.0
-) -> bool:
-    """
-    Retorna True se conseguiu avançar de página clicando no número (cur+1).
-    Fallback para ASPx.GVPagerOnClick quando disponível.
-    Sincroniza a troca usando a âncora (se fornecida).
-    """
-    # guarda âncora atual para sincronizar a mudança
-    old_anchor = None
-    if wait_anchor_by and wait_anchor_selector:
-        try:
-            old_anchor = driver.find_element(wait_anchor_by, wait_anchor_selector)
-        except Exception:
-            old_anchor = None
 
-    ok = driver.execute_script(r"""
+def _resolver_locator(n):
+    n_low = (n or "").strip().lower()
+    if n_low in ("editar", "btn editar"):
+        return (By.CSS_SELECTOR, "#toolBarResult #toolBarEditItem, #toolBarEditItem")
+    if n_low in ("dados fiscais", "dadosfiscais", "aba dados fiscais"):
+        return (By.CSS_SELECTOR, "a[href='#dadosFiscais'], [data-target='#dadosFiscais']")
+    if n_low in ("cancelar", "btn cancelar"):
+        return (By.ID, "toolBarCancelItem")
+    raise ValueError(f"Alvo '{n}' não mapeado para locator direto.")
+
+def clicar(driver, n, g=None, timeout=15):
+    """
+    Clica/aciona o alvo 'n'.
+    - 'linha': foca via API (evita stale). Opcionalmente tenta clicar o <tr>.
+    - 'editar': foca g e dispara runInSession('editItem()').
+    - demais: usa locator + clique normal/JS.
+    """
+    n_low = (n or "").strip().lower()
+    waitingpanel(driver, timeout=min(12, timeout), tag=f"antes-de-clicar-{n}")
+
+    if n_low in ("linha", "linha da grid"):
+        try:
+            driver.execute_script(
+                "try{ if(window.dataGrid){"
+                " dataGrid.SetFocusedRowIndex(arguments[0]);"
+                " if(dataGrid.SelectRow) dataGrid.SelectRow(arguments[0]);"
+                "}}catch(e){}",
+                int(g)
+            )
+        except Exception:
+            pass
+        try:
+            row = WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located((By.ID, f"dataGrid_DXDataRow{int(g)}"))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", row)
+            try:
+                row.find_element(By.XPATH, "./td[1]").click()
+            except Exception:
+                try:
+                    row.click()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return
+
+    if n_low in ("editar", "btn editar"):
+        try:
+            if g is not None:
+                driver.execute_script(
+                    "try{ if(window.dataGrid){ dataGrid.SetFocusedRowIndex(arguments[0]); } }catch(e){}",
+                    int(g)
+                )
+            driver.execute_script("try { runInSession('editItem()'); } catch(e) {}")
+            return
+        except Exception:
+            pass
+
+    by, sel = _resolver_locator(n_low)
+    elem = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, sel)))
+    try:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+        except Exception:
+            pass
+        WebDriverWait(driver, 5).until(EC.element_to_be_clickable((by, sel))).click()
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", elem)
+        except Exception:
+            try:
+                elem.send_keys("\n")
+            except Exception:
+                pass
+
+# ============================
+# Lê "Não exibir no cardápio"
+# ============================
+def ler_nao_exibir_no_cardapio(driver):
+    """
+    Retorna 'sim' ou 'não' conforme o checkbox/dojo 'NaoExibirNoCardapio'.
+    Tenta várias formas: widget Dojo, input.checked, aria-checked, classe do contêiner, atributo 'checked'.
+    """
+    try:
+        return driver.execute_script("""
+            // tenta input por id/name
+            var input = document.getElementById('NaoExibirNoCardapio') ||
+                        document.querySelector("input[name='NaoExibirNoCardapio']");
+            var cont = input ? (input.closest('.dijitCheckBox') || input.parentElement) : null;
+
+            // 1) Dojo (dijit)
+            try {
+                if (window.dijit && dijit.byId) {
+                    var w = dijit.byId('NaoExibirNoCardapio');
+                    if (w && typeof w.get === 'function') {
+                        return w.get('checked') ? 'sim' : 'não';
+                    }
+                }
+            } catch(e) {}
+
+            // 2) Propriedade checked do input
+            if (input && typeof input.checked !== 'undefined')
+                return input.checked ? 'sim' : 'não';
+
+            // 3) Atributo aria-checked
+            if (input) {
+                var ac = (input.getAttribute('aria-checked') || '').toLowerCase();
+                if (ac === 'true')  return 'sim';
+                if (ac === 'false') return 'não';
+            }
+
+            // 4) Classe do container Dojo
+            if (cont && /\bdijitCheckBoxChecked\b/.test(cont.className))
+                return 'sim';
+
+            // 5) Atributo "checked" puro
+            if (input && input.getAttribute('checked') !== null)
+                return 'sim';
+
+            return 'não';
+        """)
+    except Exception:
+        return 'não'
+
+# ============================
+# Classe extrairProduto (dados)
+# ============================
+class ExtrairProduto:
+    """conjunto de funções para extrair os dados do produto."""
+    def __init__(self, driver):
+        self.driver = driver
+        self.wait = WebDriverWait(driver, 20)
+
+    def codigois(self):
+        try:
+            el = self.wait.until(EC.visibility_of_element_located((By.ID, "CodigoProduto")))
+        except TimeoutException:
+            try:
+                el = self.driver.find_element(By.NAME, "CodigoProduto")
+            except Exception:
+                el = None
+        return ((el.get_attribute("value") if el else "") or (el.text if el else "") or "").strip()
+
+    def nameis(self):
+        el = self.wait.until(EC.visibility_of_element_located((By.ID, "NomeProduto")))
+        return (el.get_attribute("value") or el.text or "").strip()
+
+    def aliquotais(self):
+        # garante que está na aba Dados Fiscais
+        if nisclickable(self.driver, "Dados Fiscais", timeout=5):
+            clicar(self.driver, "Dados Fiscais", timeout=10)
+            waitingpanel(self.driver, timeout=6, tag="dados-fiscais")
+
+        inp = None
+        try:
+            base = self.driver.find_element(By.ID, "AliquotaIcmsEfetivo")
+            inp = base if base.tag_name.lower() == "input" else None
+            if not inp:
+                try:
+                    inp = base.find_element(By.CSS_SELECTOR, "input, .dxeEditArea, input[id^='AliquotaIcmsEfetivo']")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if not inp:
+            try:
+                inp = self.driver.find_element(By.CSS_SELECTOR, "input#AliquotaIcmsEfetivo, input[id^='AliquotaIcmsEfetivo'], input[name*='AliquotaIcmsEfetivo']")
+            except Exception:
+                inp = None
+        val = (inp.get_attribute("value") if inp else "") or (inp.text if inp else "") or ""
+        return val.strip()
+
+    def extrair_produto(self):
+        """Extrai campos e retorna à lista. Confirma 'Sim' no modal de cancelamento."""
+        codigo = self.codigois()
+        nome   = self.nameis()
+        aliquo = self.aliquotais()
+        nao_exibir = ler_nao_exibir_no_cardapio(self.driver)
+
+        # Cancelar + confirmar 'Sim' no modal (quando existir)
+        try:
+            if nisclickable(self.driver, "cancelar", timeout=6):
+                clicar(self.driver, "cancelar", timeout=6)
+                clicar_botao_modal(self.driver, "Sim", "Yes", "OK", "Confirmar")
+        except Exception:
+            pass
+
+        # Espera voltar à lista
+        try:
+            esperar_resultado_visivel(self.driver, timeout=20)
+        except Exception:
+            waitingpanel(self.driver, timeout=12, tag="pos-cancelar")
+
+        return codigo, nome, aliquo, nao_exibir
+
+# ===================
+# Paginacao (NextPage)
+# ===================
+def nextPage(driver, p_atual, timeout=30):
+    """Vai para a próxima página do grid. Retorna (ok, p_novo)."""
+    ok = driver.execute_script("""
         try {
-            var root  = document.querySelector('#tabPanelResultContainer') || document;
+            var root = document.querySelector('#tabPanelResultContainer') || document;
             var pager = root.querySelector('[id*="_DXPagerBottom"], .dxgvPagerBottom, .dxpLite') || root;
             var curEl = pager.querySelector('.dxp-current');
-            var cur   = curEl ? parseInt(curEl.textContent.trim(), 10) : NaN;
+            var cur = curEl ? parseInt(curEl.textContent.trim(), 10) : NaN;
             if (!isNaN(cur)) {
-                var target = String(cur + 1);
-                var links  = pager.querySelectorAll('a.dxp-num, a[onclick*="PN"], a[aria-label]');
+                var targetText = String(cur + 1);
+                var links = pager.querySelectorAll('a.dxp-num');
                 for (var i = 0; i < links.length; i++) {
-                    var t = (links[i].textContent || '').trim();
-                    if (t === target) { links[i].click(); return true; }
+                    if (links[i].textContent.trim() === targetText) {
+                        links[i].click();
+                        return true;
+                    }
                 }
-                // fallback oficial DevExpress
                 if (window.ASPx && ASPx.GVPagerOnClick) {
                     ASPx.GVPagerOnClick('dataGrid', 'PN' + (cur)); // cur=1 => PN1 (vai pra 2)
                     return true;
@@ -204,91 +383,150 @@ def _pager_click_next_by_number(
         return false;
     """)
     if not ok:
-        return False
+        return False, p_atual
 
-    # sincronização da nova página (sem depender do YAML do "next")
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException
-
-    try:
-        if old_anchor:
-            WebDriverWait(driver, wait_timeout).until(EC.staleness_of(old_anchor))
-        if wait_anchor_by and wait_anchor_selector:
-            WebDriverWait(driver, wait_timeout).until(
-                EC.presence_of_element_located((wait_anchor_by, wait_anchor_selector))
-            )
-    except TimeoutException:
-        # pode ter avançado mesmo assim; checa heurística
-        try:
-            if wait_anchor_by and wait_anchor_selector:
-                new_anchor = driver.find_element(wait_anchor_by, wait_anchor_selector)
-                if old_anchor and new_anchor and new_anchor.id != old_anchor.id:
-                    return True
-        except Exception:
-            pass
-        return False
-
-    return True
+    waitingpanel(driver, timeout=timeout, tag="paginacao")
+    # garantir alguma linha
+    WebDriverWait(driver, 20).until(
+        lambda d: d.execute_script("""
+            var rc = document.getElementById('tabPanelResultContainer');
+            if (!rc) return false;
+            var tbl = rc.querySelector('.dxgvTable,[id^="dataGrid_DXMainTable"]');
+            if (!tbl) return false;
+            var rows = tbl.querySelectorAll('tr[id^="dataGrid_DXDataRow"], tr.dxgvDataRow');
+            return rows.length >= 1;
+        """)
+    )
+    return True, p_atual + 1
 
 
-def executar(driver):
-    if not _na_tela_produto(driver):
-        abrir_menu_principal(driver)
-        ir_para_produto_servico(driver)
-    loc = utils.load_locators("cadastro_produtos")
 
-    pag = (loc or {}).get("pagination", {}) or {}
-    next_by, next_sel = _as_tuple(pag.get("next"))
-    anchor_by, anchor_sel = _as_tuple(pag.get("anchor"))
+# ======================
+# Execução principal
+# ======================
+def executar(driver, sub_name=None, retomar=False):
+    print(f"DEBUG: Entrou em executar() com retomar={retomar}")
+    registros = []
 
-    if not next_by or not next_sel:
-        raise RuntimeError(
-            "Locators de paginação ausentes. Defina 'cadastro_produtos.pagination.next' no locators.yaml"
-        )
-
-    # --- Pergunta ao usuário ---
-    max_pages = prompt_paginas_extracao(driver)
-    if max_pages is None:
-        utils.log.info("Extração de alíquotas cancelada pelo usuário.")
-        return
-
-    # --- INÍCIO DA EXTRAÇÃO ---
-    pagina = 1
-    todos_registros = []
-    while True:
-        utils.log.info(f"Extraindo página {pagina}...")
-        registros = _coletar_dados_tabela(driver, loc)
-        utils.log.info(f"Registros extraídos nesta página: {len(registros)}")
-        todos_registros.extend(registros)
-
-        # Controle de páginas
-        if max_pages is True:
-            avancou = next_page_once(
-                driver,
-                next_by=next_by,
-                next_selector=next_sel,
-                wait_anchor_by=anchor_by,
-                wait_anchor_selector=anchor_sel,
-            )
-            if not avancou:
-                break
+    if retomar:
+        print("DEBUG: retomar=True, tentando ler checkpoint...")
+        checkpoint = ler_checkpoint()
+        print(f"DEBUG: checkpoint lido: {checkpoint}")
+        if checkpoint:
+            print(f"Retomando extração a partir da página {checkpoint['pagina']}, índice global {checkpoint['indice_global']}")
+            p = checkpoint["pagina"]
+            g = checkpoint["indice_global"]
+            max_pages = MAX_PAGES
         else:
-            if pagina >= max_pages:
-                break
-            avancou = next_page_once(
-                driver,
-                next_by=next_by,
-                next_selector=next_sel,
-                wait_anchor_by=anchor_by,
-                wait_anchor_selector=anchor_sel,
-            )
-            if not avancou:
-                break
-        pagina += 1
+            print("Nenhum checkpoint encontrado. Iniciando normalmente.")
+            # CAI PARA O FLUXO NORMAL ABAIXO (não retorna!)
+            retomar = False  # força fluxo normal
 
-    utils.log.info(f"Extração finalizada. Total de registros: {len(todos_registros)}")
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    nome_arquivo = f"produtos_{timestamp}"
-    utils.salvar_csv(nome_arquivo, todos_registros)
-    utils.salvar_json(nome_arquivo, todos_registros)
+    if not retomar:
+        print("DEBUG: Entrou no fluxo normal (não retomar), chamando prompt_paginas_extracao")
+        resp = prompt_paginas_extracao(driver)
+        print(f"DEBUG: prompt_paginas_extracao retornou: {resp}")
+        if resp is None:
+            print("Extração cancelada pelo usuário.")
+            return
+        if resp is True:
+            max_pages = MAX_PAGES
+        else:
+            max_pages = int(resp)
+        base = driver.execute_script(r"""
+            var rc  = document.getElementById('tabPanelResultContainer');
+            if (!rc) return 0;
+            var rows = rc.querySelectorAll('tr[id^="dataGrid_DXDataRow"]');
+            var minIdx = null;
+            for (var i = 0; i < rows.length; i++) {
+                var id = rows[i].id || "";
+                var m  = id.match(/DXDataRow(\d+)$/);
+                if (m) {
+                    var v = parseInt(m[1], 10);
+                    if (minIdx === null || v < minIdx) minIdx = v;
+                }
+            }
+            return (minIdx === null ? 0 : minIdx);
+        """) or 0
+
+        g = int(base)
+        p = (g // 10) + 1
+
+    print(f"DEBUG: Iniciando loop principal com p={p}, g={g}, max_pages={max_pages}")
+    try:
+        # 1) garantir tela pronta
+        continua_drive(driver)
+        waitingpanel(driver, 4, "ini")
+
+        while p <= max_pages:
+            c = g - 10 * (p - 1) + 1  # 1..10 dentro da página
+            print(f"\n===== P{p} ITEM {c-1} / 9 (g={g}) =====")
+
+            # focar linha & abrir edição
+            if not nisclickable(driver, "linha", g=g, timeout=12):
+                print(f"DEBUG: não consegui focar a linha g={g}, tentando assim mesmo…")
+            clicar(driver, "linha", g=g, timeout=12)
+            clicar(driver, "editar", g=g, timeout=12)
+
+            # garantir que a EDIÇÃO abriu mesmo (retry leve)
+            try:
+                esperar_edicao_visivel(driver, timeout=20)
+            except TimeoutException:
+                driver.execute_script("try { runInSession('editItem()'); } catch(e) {}")
+                waitingpanel(driver, timeout=8, tag="retry-editar")
+                esperar_edicao_visivel(driver, timeout=15)
+
+            # extrair + cancelar + confirmar 'Sim'
+            prod = ExtrairProduto(driver)
+            codigo, nome, aliquota, nao_exibir = prod.extrair_produto()
+            registros.append((codigo, nome, aliquota, nao_exibir))
+            salvar_checkpoint(p, g, codigo)
+
+            # garantir overlay sumido
+            waitingpanel(driver, timeout=10, tag="pos-extrair")
+
+            # virar de página quando completar 10 itens
+            if c == 10:
+                ok, p = nextPage(driver, p_atual=p)
+                if not ok:
+                    print("DEBUG: Não há próxima página; encerrando.")
+                    break
+                g = g + 1  # IDs são globais: 9->10, 19->20, ...
+                time.sleep(0.2)
+            else:
+                g += 1
+
+        # salvamento centralizado no utils.py
+        utils.salvar_csv_modular(driver, registros, prefixo="produtos")
+
+    except Exception as e:
+        # >>> SE DER ERRO, SALVA O QUE JÁ TEMOS (com prompt) <<<
+        try:
+            if registros:
+                utils.salvar_csv_modular(driver, registros, prefixo="produtos")
+            else:
+                print("\nATENÇÃO: Erro antes de coletar qualquer linha; nada foi salvo.")
+        except Exception as e2:
+            print(f"\nERRO ao salvar CSV parcial: {e2}")
+        print(f"\nMotivo do erro: {type(e).__name__}: {e}")
+        raise
+
+    input("Pressione Enter para fechar...")
+
+def salvar_checkpoint(pagina, indice_global, id_produto):
+    checkpoint = {
+        "pagina": pagina,
+        "indice_global": indice_global,
+        "id_produto": id_produto,
+    }
+    checkpoint_path = Path("artifacts/output/checkpoint.json")
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    with checkpoint_path.open("w", encoding="utf-8") as f:
+        json.dump(checkpoint, f)
+
+def ler_checkpoint():
+    checkpoint_path = Path("artifacts/output/checkpoint.json")
+    if checkpoint_path.exists():
+        with checkpoint_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    return None

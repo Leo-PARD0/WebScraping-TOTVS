@@ -41,7 +41,7 @@ def _importar_submodulo(nome: str):
     return importlib.import_module(f".submods.{nome}", package=__package__ or "modulos.cadastro_produtos")
 
 
-def executar(driver: WebDriver, sub_name: str | None = None) -> None:
+def executar(driver: WebDriver, sub_name: str | None = None, retomar: bool = False) -> None:
     # 1) Navegação até a tela
     abrir_menu_principal(driver)
     ir_para_produto_servico(driver)
@@ -69,5 +69,5 @@ def executar(driver: WebDriver, sub_name: str | None = None) -> None:
         raise RuntimeError(f"O submódulo '{nome}.py' precisa expor executar(driver).")
 
     toast(driver, f"Executando submódulo: {nome}…", 1800)
-    mod.executar(driver)
+    mod.executar(driver, sub_name=sub_name, retomar=retomar)
     toast(driver, f"Submódulo '{nome}' finalizado.", 2200)

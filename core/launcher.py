@@ -70,6 +70,7 @@ def _parse_cli() -> argparse.Namespace:
     p.add_argument("--sub", help="Nome do submódulo em modulos/<mod>/submods/ (ex.: extrair_aliquota)")  # <-- NOVO
     p.add_argument("--headless", action="store_true", help="Força navegador headless")
     p.add_argument("--log", default=os.getenv("APP_LOG_LEVEL", "INFO"), help="Nivel de log (DEBUG, INFO, WARNING)")
+    p.add_argument('--retomar', action='store_true', help='Retomar extração do último checkpoint')
     return p.parse_args()
 
 
@@ -148,11 +149,20 @@ def _listar_submods(mod_name: str) -> list[str]:
     subdir = BASE_DIR / "modulos" / mod_name / "submods"
     if not subdir.exists():
         return []
-    return [
+    submods = []
+    # Arquivos .py (exceto __init__)
+    submods += [
         p.stem
         for p in subdir.glob("*.py")
         if p.is_file() and p.stem != "__init__"
     ]
+    # Pastas com __init__.py (pacotes)
+    submods += [
+        p.name
+        for p in subdir.iterdir()
+        if p.is_dir() and (p / "__init__.py").exists()
+    ]
+    return submods
 
 
 def _resolver_modulo(driver, preferido: Optional[str]) -> Tuple[str, callable]:
@@ -211,22 +221,24 @@ def main():
     args = _parse_cli()
     _setup_logging(args.log)
 
+    # NOVO: Suporte a --sub giro.teste
+    submod = args.sub
+    subsubmod = None
+    if args.sub and '.' in args.sub:
+        submod, subsubmod = args.sub.split('.', 1)
+        args.sub = submod  # para as validações continuarem funcionando
+
     preferido = args.mod or os.getenv("APP_MODULE")
     cfg = get_config(args)
 
     driver = None
     try:
         driver = build_driver(cfg)
-
-        # Login e seleção de domínio deixam a página pronta para injetar a UI
         login(driver, cfg)
         selecionar_dominio(driver)
 
-        # Escolha do módulo via UI (ou fallback)
-
-       # ===== Execução direta via CLI: --mod + --sub =====
+        # ===== Execução direta via CLI: --mod + --sub =====
         if args.mod and args.sub:
-            # validações (como você já faz) ...
             mods = listar_modulos()
             nomes_mod = {n for (n, _) in mods}
             if args.mod not in nomes_mod:
@@ -238,13 +250,16 @@ def main():
                 opcoes = ", ".join(sorted(subs)) or "<nenhum>"
                 raise SystemExit(f"[ERRO] Submódulo '{args.sub}' não encontrado em '{args.mod}'. Submódulos: {opcoes}")
 
-            # 👉 chama o MAIN do módulo, passando o sub_name
             pkg_main = importlib.import_module(f"modulos.{args.mod}.main")
             if not hasattr(pkg_main, "executar"):
                 raise SystemExit(f"[ERRO] Módulo '{args.mod}' não possui função main.executar(driver, sub_name=None).")
 
             log.info("Executando módulo: %s (sub=%s)", args.mod, args.sub)
-            pkg_main.executar(driver, sub_name=args.sub)
+            # Aqui passa o subsubmodulo (se houver) para o main.py do submódulo
+            sub_name_full = args.sub
+            if subsubmod:
+                sub_name_full = f"{submod}.{subsubmod}"
+            pkg_main.executar(driver, sub_name=sub_name_full, retomar=args.retomar)
             return
         
         # ===== Execução normal (sem --sub) =====
